@@ -1,0 +1,232 @@
+*&---------------------------------------------------------------------*
+*& Report  : ZGEBI_VENDOR_STOCK_SO_RPT
+*& Title   : Vendor - Stock - Open Sales Order ALV Report
+*& Author  : GlobalEdge Industries (Academic Project)
+*& T-Code  : ZGEBI01
+*& Created : 2024-25
+*&---------------------------------------------------------------------*
+REPORT ZGEBI_VENDOR_STOCK_SO_RPT.
+
+*----------------------------------------------------------------------*
+* TYPE-POOLS
+*----------------------------------------------------------------------*
+TYPE-POOLS: SLIS.
+
+*----------------------------------------------------------------------*
+* TABLES
+*----------------------------------------------------------------------*
+TABLES: LFA1, EKKO, EKPO, MARD, VBAK, VBAP.
+
+*----------------------------------------------------------------------*
+* CUSTOM OUTPUT STRUCTURE  (also defined in SE11 as ZGEBI_ALV_STR)
+*----------------------------------------------------------------------*
+TYPES: BEGIN OF TY_OUTPUT,
+         LIFNR TYPE LFA1-LIFNR,     "Vendor Number
+         NAME1 TYPE LFA1-NAME1,     "Vendor Name
+         EBELN TYPE EKKO-EBELN,     "Purchase Order Number
+         MATNR TYPE EKPO-MATNR,     "Material Number
+         MENGE TYPE EKPO-MENGE,     "PO Quantity
+         NETWR TYPE EKPO-NETWR,     "Net Value
+         LABST TYPE MARD-LABST,     "Unrestricted Stock
+         VBELN TYPE VBAK-VBELN,     "Sales Order Number
+         POSNR TYPE VBAP-POSNR,     "Sales Order Item
+         KWMENG TYPE VBAP-KWMENG,   "Sales Order Quantity
+       END OF TY_OUTPUT.
+
+*----------------------------------------------------------------------*
+* INTERNAL TABLES & WORK AREAS
+*----------------------------------------------------------------------*
+DATA: IT_OUTPUT   TYPE STANDARD TABLE OF TY_OUTPUT,
+      WA_OUTPUT   TYPE TY_OUTPUT,
+      IT_FIELDCAT TYPE SLIS_T_FIELDCAT_ALV,
+      WA_FIELDCAT TYPE SLIS_FIELDCAT_ALV,
+      GS_LAYOUT   TYPE SLIS_LAYOUT_ALV,
+      GS_VARIANT  TYPE DISVARIANT.
+
+*----------------------------------------------------------------------*
+* SELECTION SCREEN
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK B1 WITH FRAME TITLE TEXT-001.
+  SELECT-OPTIONS: S_BUKRS FOR EKKO-BUKRS OBLIGATORY DEFAULT 'GE01',
+                  S_WERKS FOR EKPO-WERKS            DEFAULT 'P001',
+                  S_LIFNR FOR EKKO-LIFNR,
+                  S_MATNR FOR EKPO-MATNR,
+                  S_EBDAT FOR EKKO-AEDAT.
+SELECTION-SCREEN END OF BLOCK B1.
+
+*----------------------------------------------------------------------*
+* INITIALIZATION
+*----------------------------------------------------------------------*
+INITIALIZATION.
+  GS_VARIANT-REPORT = SY-REPID.
+
+*----------------------------------------------------------------------*
+* START OF SELECTION
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  PERFORM CHECK_AUTHORIZATION.
+  PERFORM FETCH_DATA.
+
+  IF IT_OUTPUT IS INITIAL.
+    MESSAGE 'No records found for the selected criteria.' TYPE 'I'.
+    STOP.
+  ENDIF.
+
+  PERFORM BUILD_FIELDCAT.
+  PERFORM SET_LAYOUT.
+  PERFORM DISPLAY_ALV.
+
+*----------------------------------------------------------------------*
+* FORM: CHECK_AUTHORIZATION
+*----------------------------------------------------------------------*
+FORM CHECK_AUTHORIZATION.
+  AUTHORITY-CHECK OBJECT 'Z_GE_RPT'
+    ID 'BUKRS' FIELD S_BUKRS-LOW.
+  IF SY-SUBRC <> 0.
+    MESSAGE 'Not authorized to run this report.' TYPE 'E'.
+  ENDIF.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* FORM: FETCH_DATA
+* Reads Vendor + PO + Stock + Sales Order data into IT_OUTPUT
+*----------------------------------------------------------------------*
+FORM FETCH_DATA.
+
+  DATA: LT_PO   TYPE STANDARD TABLE OF TY_OUTPUT,
+        LT_MARD TYPE STANDARD TABLE OF MARD,
+        LT_SO   TYPE STANDARD TABLE OF TY_OUTPUT,
+        WA_MARD TYPE MARD.
+
+  " Step 1: Fetch Vendor + Open Purchase Orders
+  SELECT A~LIFNR A~NAME1 B~EBELN C~MATNR C~MENGE C~NETWR
+    INTO CORRESPONDING FIELDS OF TABLE LT_PO
+    FROM LFA1 AS A
+    INNER JOIN EKKO AS B ON A~LIFNR = B~LIFNR
+    INNER JOIN EKPO AS C ON B~EBELN = C~EBELN
+    WHERE B~BUKRS IN S_BUKRS
+      AND C~WERKS IN S_WERKS
+      AND A~LIFNR IN S_LIFNR
+      AND C~MATNR IN S_MATNR
+      AND B~AEDAT IN S_EBDAT
+      AND C~ELIKZ = ' '.    " Only open PO items (not fully delivered)
+
+  " Step 2: Enrich with Stock data from MARD
+  LOOP AT LT_PO INTO WA_OUTPUT.
+    SELECT SINGLE LABST INTO WA_OUTPUT-LABST
+      FROM MARD
+      WHERE MATNR = WA_OUTPUT-MATNR
+        AND WERKS IN S_WERKS
+        AND LGORT = 'SL01'.
+    APPEND WA_OUTPUT TO IT_OUTPUT.
+  ENDLOOP.
+
+  " Step 3: Fetch Open Sales Orders and update IT_OUTPUT
+  LOOP AT IT_OUTPUT INTO WA_OUTPUT.
+    SELECT SINGLE A~VBELN B~POSNR B~KWMENG
+      INTO (WA_OUTPUT-VBELN, WA_OUTPUT-POSNR, WA_OUTPUT-KWMENG)
+      FROM VBAK AS A
+      INNER JOIN VBAP AS B ON A~VBELN = B~VBELN
+      WHERE B~MATNR = WA_OUTPUT-MATNR
+        AND A~AUART = 'OR'
+        AND B~GBSTA <> 'C'.   " Exclude fully completed items
+    MODIFY IT_OUTPUT FROM WA_OUTPUT.
+  ENDLOOP.
+
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* FORM: BUILD_FIELDCAT
+* Defines columns for the ALV Grid
+*----------------------------------------------------------------------*
+FORM BUILD_FIELDCAT.
+
+  DATA: LT_EXCLUDE TYPE SLIS_T_EXTAB.
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      I_PROGRAM_NAME         = SY-REPID
+      I_INTERNAL_TABNAME     = 'IT_OUTPUT'
+      I_INCLNAME             = SY-REPID
+    CHANGING
+      CT_FIELDCAT            = IT_FIELDCAT
+    EXCEPTIONS
+      INCONSISTENT_INTERFACE = 1
+      OTHERS                 = 2.
+
+  " Customize individual field properties
+  LOOP AT IT_FIELDCAT INTO WA_FIELDCAT.
+    CASE WA_FIELDCAT-FIELDNAME.
+      WHEN 'LIFNR'. WA_FIELDCAT-SELTEXT_M = 'Vendor No.'.   WA_FIELDCAT-KEY = 'X'.
+      WHEN 'NAME1'. WA_FIELDCAT-SELTEXT_M = 'Vendor Name'.
+      WHEN 'EBELN'. WA_FIELDCAT-SELTEXT_M = 'PO Number'.    WA_FIELDCAT-HOTSPOT = 'X'.
+      WHEN 'MATNR'. WA_FIELDCAT-SELTEXT_M = 'Material'.
+      WHEN 'MENGE'. WA_FIELDCAT-SELTEXT_M = 'PO Qty'.       WA_FIELDCAT-DO_SUM = 'X'.
+      WHEN 'NETWR'. WA_FIELDCAT-SELTEXT_M = 'Net Value'.    WA_FIELDCAT-DO_SUM = 'X'.
+      WHEN 'LABST'. WA_FIELDCAT-SELTEXT_M = 'Stock (Unr.)'. WA_FIELDCAT-DO_SUM = 'X'.
+      WHEN 'VBELN'. WA_FIELDCAT-SELTEXT_M = 'Sales Order'.
+      WHEN 'KWMENG'.WA_FIELDCAT-SELTEXT_M = 'SO Qty'.       WA_FIELDCAT-DO_SUM = 'X'.
+    ENDCASE.
+    MODIFY IT_FIELDCAT FROM WA_FIELDCAT.
+  ENDLOOP.
+
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* FORM: SET_LAYOUT
+*----------------------------------------------------------------------*
+FORM SET_LAYOUT.
+  GS_LAYOUT-ZEBRA             = 'X'.   " Alternating row colors
+  GS_LAYOUT-COLWIDTH_OPTIMIZE = 'X'.   " Auto column width
+  GS_LAYOUT-TOTALS_TEXT       = 'Totals'.
+  GS_LAYOUT-DETAIL_POPUP      = 'X'.   " Show detail popup on click
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* FORM: DISPLAY_ALV
+*----------------------------------------------------------------------*
+FORM DISPLAY_ALV.
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      I_CALLBACK_PROGRAM      = SY-REPID
+      I_CALLBACK_USER_COMMAND = 'USER_COMMAND'
+      IS_LAYOUT               = GS_LAYOUT
+      IT_FIELDCAT             = IT_FIELDCAT
+      IS_VARIANT              = GS_VARIANT
+      I_SAVE                  = 'A'
+      I_DEFAULT               = 'X'
+    TABLES
+      T_OUTTAB                = IT_OUTPUT
+    EXCEPTIONS
+      PROGRAM_ERROR           = 1
+      OTHERS                  = 2.
+
+  IF SY-SUBRC <> 0.
+    MESSAGE 'Error displaying ALV report.' TYPE 'E'.
+  ENDIF.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* FORM: USER_COMMAND
+* Handles hotspot click on PO Number -> opens ME23N
+*----------------------------------------------------------------------*
+FORM USER_COMMAND USING R_UCOMM     TYPE SY-UCOMM
+                        RS_SELFIELD TYPE SLIS_SELFIELD.
+
+  DATA: LV_EBELN TYPE EKKO-EBELN.
+
+  IF RS_SELFIELD-FIELDNAME = 'EBELN'.
+    READ TABLE IT_OUTPUT INTO WA_OUTPUT INDEX RS_SELFIELD-TABINDEX.
+    IF SY-SUBRC = 0.
+      LV_EBELN = WA_OUTPUT-EBELN.
+      SET PARAMETER ID 'BES' FIELD LV_EBELN.
+      CALL TRANSACTION 'ME23N' AND SKIP FIRST SCREEN.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& END OF REPORT ZGEBI_VENDOR_STOCK_SO_RPT
+*&---------------------------------------------------------------------*
+
